@@ -12,7 +12,13 @@ from dateutil.relativedelta import relativedelta
 
 # Configuración inicial
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
-CREDENTIALS_FILE = 'credentials.json'
+print("=== CONFIGURACIÓN DE CREDENCIALES ===")
+CREDENTIALS_FILE = input("Ingrese la ruta del archivo credentials.json: ").strip()
+
+if not os.path.exists(CREDENTIALS_FILE):
+    print(f"Archivo no encontrado: {CREDENTIALS_FILE}")
+    exit()
+
 TOKEN_FILE = 'token.json'
 
 # Expresiones regulares para extraer la información
