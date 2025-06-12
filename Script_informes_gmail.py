@@ -50,123 +50,106 @@ def get_gmail_service():
     return build('gmail', 'v1', credentials=creds)
 
 def extract_info_from_email(body, is_html=False):
-    info = {
-        'usuario': '',
-        'cpu_nuevo': '',
-        'monitor_nuevo': '',
-        'teclado_nuevo': '',
-        'cpu_viejo': '',
-        'monitor_viejo': '',
-        'teclado_viejo': '',
-        'fecha': ''
-    }
-
+    """
+    Extrae una o varias filas de inventario de un correo.
+    - Si detecta HTML: recorre todas las <table>, todas sus filas de datos y devuelve
+      una lista de dicts (uno por cada row).
+    - Si no es HTML o no hay tablas válidas: usa findall() con regex para capturar
+      múltiples ocurrencias de cada patrón y devuelve un único dict.
+    """
     if is_html:
-        soup = BeautifulSoup(body, 'html.parser')
-        table = soup.find('table')
-        if table:
-            rows = table.find_all('tr')
-            if len(rows) > 1:  # Tiene al menos una fila de datos
-                headers = [th.get_text(strip=True).lower() for th in rows[0].find_all(['td', 'th'])]
-                values = [td.get_text(strip=True) for td in rows[1].find_all('td')]
+        soup   = BeautifulSoup(body, 'html.parser')
+        tables = soup.find_all('table')
+        resultados = []
 
-                if len(headers) == 7 and len(values) == 7:
-                    info['usuario'] = values[0]
-                    info['cpu_nuevo'] = values[1]
-                    info['monitor_nuevo'] = values[2]
-                    info['teclado_nuevo'] = values[3]
-                    info['cpu_viejo'] = values[4]
-                    info['monitor_viejo'] = values[5]
-                    info['teclado_viejo'] = values[6]
-                    return info
+        for tbl in tables:
+            rows = tbl.find_all('tr')
+            # Salta tablas sin datos (menos de 2 filas)
+            if len(rows) < 2:
+                continue
 
-    # Fallback: texto plano con regex
+            # Para cada fila de datos (desde la segunda)
+            for row in rows[1:]:
+                cols = row.find_all('td')
+                if len(cols) < 7:
+                    continue
+                info = {
+                    'usuario'        : cols[0].get_text(strip=True),
+                    'cpu_nuevo'      : cols[1].get_text(strip=True),
+                    'monitor_nuevo'  : cols[2].get_text(strip=True),
+                    'teclado_nuevo'  : cols[3].get_text(strip=True),
+                    'cpu_viejo'      : cols[4].get_text(strip=True),
+                    'monitor_viejo'  : cols[5].get_text(strip=True),
+                    'teclado_viejo'  : cols[6].get_text(strip=True),
+                }
+                resultados.append(info)
+
+        if resultados:
+            return resultados
+
+    # —————————————————————————————
+    # Fallback: texto plano con regex (captura múltiples ocurrencias)
+    
+    info = { key: [] for key in PATTERNS }
     for key, pattern in PATTERNS.items():
-        match = pattern.search(body)
-        if match:
-            info[key] = match.group(1).strip()
+        matches = pattern.findall(body)
+        info[key] = [m.strip() for m in matches]
 
-    return info
+    # Convertir listas en comas o cadena vacía
+    single = { key: (",".join(vals) if vals else "") for key, vals in info.items() }
+    return [ single ]
 
 def process_emails_by_date_range(service, start_date, end_date, max_results=None):
-    # Formatear fechas para la consulta Gmail
-    start_date_str = start_date.strftime('%Y/%m/%d')
-    end_date_str = end_date.strftime('%Y/%m/%d')
-    
-    # Buscar correos con términos específicos y en el rango de fechas
-    query = f'"Remplazo por obsolescencia" after:{start_date_str} before:{end_date_str}'
-    
-    print(f"Buscando correos entre {start_date_str} y {end_date_str}...")
-    
-    response = service.users().messages().list(
-        userId='me',
-        q=query,
-        maxResults=max_results if max_results else 500,
-        includeSpamTrash=False
-    ).execute()
-    
+    start_str = start_date.strftime('%Y/%m/%d')
+    end_str   = end_date.strftime('%Y/%m/%d')
+    query = f'"Remplazo por obsolescencia" after:{start_str} before:{end_str}'
+
     messages = []
-    if 'messages' in response:
-        messages.extend(response['messages'])
-    
-    while 'nextPageToken' in response and (not max_results or len(messages) < max_results):
-        page_token = response['nextPageToken']
-        response = service.users().messages().list(
-            userId='me',
-            q=query,
-            maxResults=max_results if max_results else 500,
-            includeSpamTrash=False,
-            pageToken=page_token
+    resp = service.users().messages().list(userId='me', q=query,
+                                           maxResults=max_results or 500).execute()
+    messages.extend(resp.get('messages', []))
+    while 'nextPageToken' in resp and (not max_results or len(messages) < max_results):
+        resp = service.users().messages().list(
+            userId='me', q=query,
+            maxResults=max_results or 500,
+            pageToken=resp['nextPageToken']
         ).execute()
-        messages.extend(response['messages'])
-        
+        messages.extend(resp.get('messages', []))
         if max_results and len(messages) >= max_results:
             messages = messages[:max_results]
             break
-    
-    # Procesar cada mensaje
+
     resultados = []
-    for message in messages:
-        msg = service.users().messages().get(
-            userId='me',
-            id=message['id'],
-            format='full'
-        ).execute()
-        
-        # Extraer fecha
-        fecha = datetime.fromtimestamp(int(msg['internalDate'])/1000)
-        fecha_str = fecha.strftime('%Y-%m-%d %H:%M:%S')
-        
-        # Extraer cuerpo del mensaje
-        body = ''
+    for m in messages:
+        try:
+            msg = service.users().messages().get(
+                userId='me', id=m['id'], format='full'
+            ).execute()
+            fecha = datetime.fromtimestamp(int(msg['internalDate'])/1000)
+            fecha_str = fecha.strftime('%Y-%m-%d %H:%M:%S')
 
-        body = ''
-        is_html = False
+            # Decodificar cuerpo
+            body, is_html = "", False
+            for part in msg.get('payload', {}).get('parts', []):
+                mt = part.get('mimeType','')
+                data = part.get('body',{}).get('data')
+                if mt == 'text/html' and data:
+                    body = base64.urlsafe_b64decode(data).decode('utf-8')
+                    is_html = True
+                    break
+                if mt == 'text/plain' and data and not body:
+                    body = base64.urlsafe_b64decode(data).decode('utf-8')
 
-        if 'parts' in msg['payload']:
-            for part in msg['payload']['parts']:
-                mime = part['mimeType']
-                if mime == 'text/html':
-                    data = part['body'].get('data')
-                    if data:
-                        body = base64.urlsafe_b64decode(data).decode('utf-8')
-                        is_html = True
-                        break
-                elif mime == 'text/plain' and not body:
-                    data = part['body'].get('data')
-                    if data:
-                        body = base64.urlsafe_b64decode(data).decode('utf-8')
-        else:
-            if 'body' in msg['payload'] and 'data' in msg['payload']['body']:
-                data = msg['payload']['body']['data']
-                body = base64.urlsafe_b64decode(data).decode('utf-8')
+            # Extraer N registros de este correo
+            registros = extract_info_from_email(body, is_html)
+            for info in registros:
+                info['fecha'] = fecha_str
+                resultados.append(info)
 
-        info = extract_info_from_email(body, is_html=is_html)
+        except Exception as e:
+            print(f"⚠️ Error procesando mensaje {m['id']}: {e}")
+            continue
 
-
-        info['fecha'] = fecha_str
-        resultados.append(info)
-    
     return resultados
 
 def save_to_csv(data, start_date, end_date):
